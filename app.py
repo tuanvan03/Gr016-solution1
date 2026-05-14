@@ -10,9 +10,11 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import base64
 import io
 import math
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +51,7 @@ HIGHLIGHT_COLORS: dict[str, str] = {
     "endpoint_board": "#0f766e",
     "circle_board": "#db2777",
     "distance_x": "#dc2626",
-    "distance_y": "#2563eb",
+    "distance_y": "#f59e0b",
     "distance_edge": "#f59e0b",
     "distance_angle": "#7c3aed",
     "distance_radius": "#16a34a",
@@ -63,8 +65,8 @@ HIGHLIGHT_COLORS: dict[str, str] = {
     "lack_distance_y": "#3b82f6",
     "lack_distance_other": "#a855f7",
     "final_distance_x": "#b91c1c",
-    "final_distance_y": "#1d4ed8",
-    "final_distance_oz": "#047857",
+    "final_distance_y": "#115e59",
+    "final_distance_oz": "#f97316",
 }
 
 # ---------------------------------------------------------------------------
@@ -127,6 +129,50 @@ def read_dxf_entities(dxf_bytes: bytes) -> list[dict[str, Any]]:
                     "start_angle": float(entity.dxf.start_angle),
                     "end_angle": float(entity.dxf.end_angle),
                 })
+            elif etype == "DIMENSION":
+                dim_type = int(getattr(entity.dxf, "dimtype", 0)) & 7
+                entry: dict[str, Any] = {
+                    "type": "DIMENSION",
+                    "dim_type": dim_type,
+                    "kind": "distance_other",
+                }
+
+                for name in ("defpoint", "defpoint2", "defpoint3", "defpoint4", "defpoint5", "text_midpoint"):
+                    point = getattr(entity.dxf, name, None)
+                    if point is None:
+                        continue
+                    entry[name] = [round(float(point.x), 4), round(float(point.y), 4)]
+
+                if dim_type == 0:
+                    angle = float(getattr(entity.dxf, "angle", 0.0))
+                    entry["angle"] = angle
+                    if "defpoint2" in entry:
+                        entry["start"] = entry["defpoint2"]
+                    if "defpoint3" in entry:
+                        entry["end"] = entry["defpoint3"]
+                    if "defpoint" in entry:
+                        entry["dimension_point"] = entry["defpoint"]
+                    entry["kind"] = "distance_x" if abs((angle % 180.0)) < 1e-6 else "distance_y"
+                elif dim_type == 1:
+                    if "defpoint2" in entry:
+                        entry["start"] = entry["defpoint2"]
+                    if "defpoint3" in entry:
+                        entry["end"] = entry["defpoint3"]
+                    if "defpoint" in entry:
+                        entry["dimension_point"] = entry["defpoint"]
+                    entry["kind"] = "distance_edge"
+                elif dim_type == 2:
+                    entry["kind"] = "distance_angle"
+                elif dim_type == 3:
+                    if "defpoint" in entry:
+                        entry["center"] = entry["defpoint"]
+                    if "defpoint4" in entry:
+                        entry["point_on_circle"] = entry["defpoint4"]
+                    entry["kind"] = "distance_radius"
+                else:
+                    entry["kind"] = "distance_other"
+
+                entities.append(entry)
         except Exception:
             continue  # skip malformed entities
 
@@ -251,6 +297,51 @@ def overlay_analysis_highlights(
                 ))
 
 
+def overlay_initial_constraints(
+    fig: go.Figure,
+    entities: list[dict[str, Any]],
+) -> None:
+    """Overlay raw DIMENSION entities with a fixed 10-unit offset."""
+    for ent in entities:
+        if not isinstance(ent, dict) or ent.get("type") != "DIMENSION":
+            continue
+
+        kind = str(ent.get("kind") or "")
+        if kind in ("distance_x", "distance_y"):
+            start = ent.get("defpoint2") or ent.get("start")
+            end = ent.get("defpoint3") or ent.get("end")
+            angle = float(ent.get("angle", 0.0))
+            if not start or not end:
+                continue
+            _overlay_axis_dimension(fig, start, end, angle, kind, "#0f20dc", 10.0)
+            continue
+
+        if kind == "distance_edge":
+            start = ent.get("defpoint2") or ent.get("start")
+            end = ent.get("defpoint3") or ent.get("end")
+            dim_point = ent.get("defpoint") or ent.get("dimension_point")
+            if not start or not end or not dim_point:
+                continue
+            _overlay_dimension_with_fixed_offset(fig, start, end, dim_point, "#0f20dc", 10.0)
+            continue
+
+        if kind == "distance_radius" or (
+            kind == "distance_other"
+            and (ent.get("center") or ent.get("defpoint"))
+            and (ent.get("point_on_circle") or ent.get("defpoint4"))
+        ):
+            center = ent.get("center") or ent.get("defpoint")
+            point_on_circle = ent.get("point_on_circle") or ent.get("defpoint4")
+            if not center or not point_on_circle:
+                continue
+            c = _as_point(center)
+            p = _as_point(point_on_circle)
+            _add_line(fig, c, p, "#0f20dc", 0.8)
+            _arrow_head(fig, p[0], p[1], math.atan2(c[1] - p[1], c[0] - p[0]), "#0f20dc", 2.5)
+            radius = _distance(c, p)
+            _add_text(fig, ((c[0] + p[0]) / 2, (c[1] + p[1]) / 2), f"{radius:.2f}".rstrip("0").rstrip("."), "#0f20dc")
+
+
 def _arrow_head(
     fig: go.Figure,
     tip_x: float, tip_y: float,
@@ -274,6 +365,76 @@ def _arrow_head(
     ))
 
 
+def _overlay_dimension_with_fixed_offset(
+    fig: go.Figure,
+    start: list[float] | tuple[float, float],
+    end: list[float] | tuple[float, float],
+    dimension_point: list[float] | tuple[float, float],
+    color: str,
+    offset_distance: float,
+) -> None:
+    p1 = _as_point(start)
+    p2 = _as_point(end)
+    _ = dimension_point  # keep the signature aligned with the analysis overlay helpers
+
+    dx = abs(p2[0] - p1[0])
+    dy = abs(p2[1] - p1[1])
+    if dx >= dy:
+        offset_vec = (0.0, offset_distance)
+    else:
+        offset_vec = (offset_distance, 0.0)
+
+    d1 = (p1[0] + offset_vec[0], p1[1] + offset_vec[1])
+    d2 = (p2[0] + offset_vec[0], p2[1] + offset_vec[1])
+
+    _add_line(fig, p1, d1, "#6b7280", 0.6)
+    _add_line(fig, p2, d2, "#6b7280", 0.6)
+    _add_line(fig, d1, d2, color, 0.8, dash="dash")
+
+    measured = _distance(p1, p2)
+    arrow_size = max(measured * 0.02, 2.0)
+    _arrow_head(fig, d1[0], d1[1], math.atan2(d2[1] - d1[1], d2[0] - d1[0]), color, arrow_size)
+    _arrow_head(fig, d2[0], d2[1], math.atan2(d1[1] - d2[1], d1[0] - d2[0]), color, arrow_size)
+    _add_text(fig, ((d1[0] + d2[0]) / 2, (d1[1] + d2[1]) / 2), f"{measured:.2f}", color)
+
+
+def _overlay_axis_dimension(
+    fig: go.Figure,
+    start: list[float] | tuple[float, float],
+    end: list[float] | tuple[float, float],
+    angle: float,
+    kind: str,
+    color: str,
+    offset_distance: float,
+) -> None:
+    p1 = _as_point(start)
+    p2 = _as_point(end)
+
+    if kind == "distance_x":
+        axis_end = (p2[0], p1[1])
+        offset_vec = (0.0, offset_distance)
+        measured = abs(axis_end[0] - p1[0])
+    else:
+        axis_end = (p1[0], p2[1])
+        offset_vec = (offset_distance, 0.0)
+        measured = abs(axis_end[1] - p1[1])
+
+    d1 = (p1[0] + offset_vec[0], p1[1] + offset_vec[1])
+    d2 = (axis_end[0] + offset_vec[0], axis_end[1] + offset_vec[1])
+    _add_line(fig, p1, d1, "#6b7280", 0.6)
+    _add_line(fig, p2, d2, "#6b7280", 0.6)
+    _add_line(fig, d1, d2, color, 0.8, dash="dash")
+
+    arrow_size = max(measured * 0.02, 2.0)
+    _arrow_head(fig, d1[0], d1[1], math.atan2(d2[1] - d1[1], d2[0] - d1[0]), color, arrow_size)
+    _arrow_head(fig, d2[0], d2[1], math.atan2(d1[1] - d2[1], d1[0] - d2[0]), color, arrow_size)
+
+    label = f"{measured:.2f}".rstrip("0").rstrip(".")
+    if not label:
+        label = "0"
+    _add_text(fig, ((d1[0] + d2[0]) / 2, (d1[1] + d2[1]) / 2), label, color)
+
+
 def overlay_constraints(
     fig: go.Figure,
     payload: dict[str, Any],
@@ -292,8 +453,17 @@ def overlay_constraints(
         if not items:
             continue
         for item in items:
+            if not isinstance(item, dict):
+                continue
             start = item.get("start")
             end = item.get("end")
+            dim_point = item.get("dimension_point")
+            if key in ("distance_x", "distance_y") and start and end and dim_point:
+                _overlay_linear_dimension(fig, start, end, dim_point, ARROW_COLOR, HEAD_SIZE)
+                continue
+            if key == "distance_radius" and item.get("center") and item.get("point_on_circle"):
+                _overlay_radius_dimension(fig, item, ARROW_COLOR)
+                continue
             if not start or not end or len(start) < 2 or len(end) < 2:
                 continue
 
@@ -341,6 +511,124 @@ def overlay_constraints(
                 showlegend=False,
                 hoverinfo="skip",
             ))
+
+
+def _overlay_linear_dimension(
+    fig: go.Figure,
+    start: list[float] | tuple[float, float],
+    end: list[float] | tuple[float, float],
+    dimension_point: list[float] | tuple[float, float],
+    color: str,
+    head_size: float,
+) -> None:
+    p1 = (float(start[0]), float(start[1]))
+    p2 = (float(end[0]), float(end[1]))
+    dp = (float(dimension_point[0]), float(dimension_point[1]))
+
+    direction = _snap_direction(_unit_vector(p2[0] - p1[0], p2[1] - p1[1]), 5.0)
+    normal = (-direction[1], direction[0])
+    offset = _dot(dp[0] - p1[0], dp[1] - p1[1], normal[0], normal[1])
+    d1 = (p1[0] + normal[0] * offset, p1[1] + normal[1] * offset)
+    d2 = (p2[0] + normal[0] * offset, p2[1] + normal[1] * offset)
+    measured = abs(_dot(p2[0] - p1[0], p2[1] - p1[1], direction[0], direction[1]))
+    arrow_size = max(measured * 0.02, 2.0)
+    mid = ((d1[0] + d2[0]) / 2, (d1[1] + d2[1]) / 2)
+    text_point = (mid[0] + normal[0] * (arrow_size * 2.2), mid[1] + normal[1] * (arrow_size * 2.2))
+
+    _add_line(fig, p1, d1, "#6b7280", 0.6)
+    _add_line(fig, p2, d2, "#6b7280", 0.6)
+    _add_line(fig, d1, d2, color, 0.8, dash="dash")
+    _arrow_head(fig, d1[0], d1[1], math.atan2(d2[1] - d1[1], d2[0] - d1[0]), color, arrow_size)
+    _arrow_head(fig, d2[0], d2[1], math.atan2(d1[1] - d2[1], d1[0] - d2[0]), color, arrow_size)
+    fig.add_trace(go.Scatter(
+        x=[text_point[0]],
+        y=[text_point[1]],
+        mode="text",
+        text=[f"{round(measured, 2)}"],
+        textposition="middle center",
+        textfont=dict(size=10, color=color, family="Arial Black"),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+
+def _overlay_radius_dimension(
+    fig: go.Figure,
+    item: dict[str, Any],
+    color: str,
+) -> None:
+    center = item.get("center")
+    point = item.get("point_on_circle")
+    if not center or not point or len(center) < 2 or len(point) < 2:
+        return
+
+    c = (float(center[0]), float(center[1]))
+    p = (float(point[0]), float(point[1]))
+    _add_line(fig, c, p, color, 0.8)
+    _arrow_head(fig, p[0], p[1], math.atan2(c[1] - p[1], c[0] - p[0]), color, max(_distance(c, p) * 0.04, 2.0))
+
+
+def _add_line(
+    fig: go.Figure,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    color: str,
+    width: float,
+    dash: str | None = None,
+) -> None:
+    fig.add_trace(go.Scatter(
+        x=[start[0], end[0], None],
+        y=[start[1], end[1], None],
+        mode="lines",
+        line=dict(color=color, width=width, dash=dash or "solid"),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+
+def _unit_vector(dx: float, dy: float) -> tuple[float, float]:
+    length = math.hypot(dx, dy) or 1.0
+    return dx / length, dy / length
+
+
+def _dot(ax: float, ay: float, bx: float, by: float) -> float:
+    return ax * bx + ay * by
+
+
+def _snap_direction(direction: tuple[float, float], degrees_threshold: float) -> tuple[float, float]:
+    angle = math.atan2(direction[1], direction[0])
+    step = math.pi / 2
+    snapped = round(angle / step) * step
+    threshold = math.radians(degrees_threshold)
+    if abs(angle - snapped) <= threshold:
+        return math.cos(snapped), math.sin(snapped)
+    return direction
+
+
+def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+def _as_point(point: list[float] | tuple[float, float]) -> tuple[float, float]:
+    return float(point[0]), float(point[1])
+
+
+def _add_text(
+    fig: go.Figure,
+    point: tuple[float, float],
+    text: str,
+    color: str,
+) -> None:
+    fig.add_trace(go.Scatter(
+        x=[point[0]],
+        y=[point[1]],
+        mode="text",
+        text=[text],
+        textposition="middle center",
+        textfont=dict(size=10, color=color, family="Arial Black"),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +705,49 @@ def _merge_payload(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any
         elif key not in merged:
             merged[key] = value
     return merged
+
+
+def _normalize_frontend_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = deepcopy(payload)
+    for key in ("final_distance_x", "final_distance_y", "final_distance_oz"):
+        normalized[key] = _normalize_final_records(normalized.get(key), key)
+
+    highlight_groups = normalized.get("highlight_groups")
+    if isinstance(highlight_groups, dict):
+        for key in ("final_distance_x", "final_distance_y", "final_distance_oz"):
+            if key in highlight_groups:
+                highlight_groups[key] = _normalize_final_records(highlight_groups.get(key), key)
+
+    return normalized
+
+
+def _normalize_final_records(
+    records: list[dict[str, Any]] | None,
+    group_name: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(records, list):
+        return records or []
+
+    normalized: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        copy_item = dict(item)
+        points = copy_item.get("points")
+        if isinstance(points, list) and len(points) >= 2:
+            p1 = list(points[0]) if isinstance(points[0], (list, tuple)) else None
+            p2 = list(points[1]) if isinstance(points[1], (list, tuple)) else None
+            if p1 and p2 and len(p1) >= 2 and len(p2) >= 2:
+                if group_name in ("final_distance_x", "final_distance_oz") or copy_item.get("kind") in ("distance_x", "distance_oz"):
+                    p2[1] = p1[1]
+                elif group_name == "final_distance_y" or copy_item.get("kind") == "distance_y":
+                    p2[0] = p1[0]
+                copy_item["points"] = [p1[:2], p2[:2]]
+        normalized.append(copy_item)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -617,8 +948,13 @@ uploaded_file = st.sidebar.file_uploader(
     label_visibility="collapsed",
 )
 
+current_signature = None
 if uploaded_file is not None:
     dxf_bytes = uploaded_file.getvalue()
+    current_signature = hashlib.sha1(dxf_bytes).hexdigest()
+    if st.session_state.get("source_signature") != current_signature:
+        st.session_state.pop("payload", None)
+        st.session_state["source_signature"] = current_signature
     st.sidebar.success(f"✅ **{uploaded_file.name}** ({len(dxf_bytes):,} bytes)")
     run_button = st.sidebar.button("🚀 Run Analysis", type="primary", use_container_width=True)
 else:
@@ -645,20 +981,28 @@ st.sidebar.markdown("---")
 st.sidebar.metric("Entities detected", entity_count)
 
 # --- Run pipeline ---
-if run_button or "payload" not in st.session_state:
+if run_button:
     with st.spinner("🔄 Đang phân tích DXF..."):
         payload = run_pipeline(dxf_bytes)
         if payload is None:
             st.error("Phân tích thất bại. Vui lòng kiểm tra file DXF.")
             st.stop()
+        payload = _normalize_frontend_payload(payload)
         st.session_state["payload"] = payload
         st.session_state["dxf_entities"] = dxf_entities
+        if current_signature is not None:
+            st.session_state["payload_signature"] = current_signature
     st.rerun()
 
 payload = st.session_state.get("payload")
-if payload is None:
+analysis_ready = payload is not None
+if analysis_ready:
+    payload = _normalize_frontend_payload(payload) or {}
+    st.session_state["payload"] = payload
+else:
+    payload = {}
+if not analysis_ready:
     st.info("👆 Bấm **Run Analysis** để bắt đầu phân tích")
-    st.stop()
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -679,17 +1023,26 @@ with tab1:
 
     cc1, cc2 = st.columns(2)
     with cc1:
-        show_highlights = st.checkbox("🔦 Highlight analysis", value=True, key="tab1_highlights")
+        show_highlights = st.checkbox(
+            "🔦 Highlight analysis",
+            value=True,
+            key="tab1_highlights",
+            disabled=not analysis_ready,
+        )
     with cc2:
-        show_constraints = st.checkbox("📏 Constraint gốc (mũi tên đỏ)", value=True, key="tab1_constraints")
+        show_constraints = st.checkbox(
+            "📏 Constraint gốc (mũi tên đỏ)",
+            value=True,
+            key="tab1_constraints",
+        )
     col1, col2 = st.columns([3, 1])
 
     with col1:
         fig = build_dxf_figure(dxf_entities)
-        if show_highlights:
+        if analysis_ready and show_highlights:
             overlay_analysis_highlights(fig, payload)
         if show_constraints:
-            overlay_constraints(fig, payload)
+            overlay_initial_constraints(fig, dxf_entities)
         fig.update_layout(height=700)
         st.plotly_chart(fig, use_container_width=True)
 
